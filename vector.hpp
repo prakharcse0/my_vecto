@@ -240,24 +240,27 @@ public:
         }
     }
 
-    void push_back(const T& value) {
+    // class... Args — a template parameter pack: zero or more types, deduced per call.
+    // Args&& — a forwarding reference (aka "universal reference"), not an rvalue reference.
+    // args... — pack expansion at the call site.
+    template <class... Args>
+    T& emplace_back(Args&&... args) {
         if(size_ != cap_) {
-            // new (data_ + size_++) T(value); // don't - the counter that publishes "this object exists" must be updated only after the object actually exists.
-            ::new (data_ + size_) T(value);
+            ::new (data_ + size_) T(std::forward<Args>(args)...); // std::forward is basically juist conditional move
+            // std::forward(args...)                 // ONE call, all args passed to it
+            // std::forward<Args>(args)...           // N calls, one per argument   ← correct
+            // try (args) : expression contains unexpanded parameter pack args
             ++size_;
-            return;
+            return data_[size_ - 1];
         }
         
         const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
         T *new_data = static_cast<T*>(::operator new(sizeof(T)*new_cap));
        
-        // why must this always be done before the moving/copying to new buffer ?
-        // to handle the case where we are moving, and value is one of the old elements of the vector
         try {
-            ::new (new_data + size_) T(value);
+            ::new (new_data + size_) T(std::forward<Args>(args)...);
         } catch (...) {
             ::operator delete(new_data);
-            // we don't need to take care of anything that's handled by the destructor.
             throw;
         }
 
@@ -270,39 +273,18 @@ public:
         }
 
         ++size_;
+        return data_[size_ - 1];
+    }
+
+    void push_back(const T& value) {
+        // does it add extra cost of an extra function call
+        // Zero cost at -O2: GCC inlines emplace_back
+        emplace_back(value);
     }
 
     void push_back(T&& value) {
-        if(size_ != cap_) {
-            // new (data_ + size_++) T(value); // don't - the counter that publishes "this object exists" must be updated only after the object actually exists.
-            ::new (data_ + size_) T(std::move(value));
-            ++size_;
-            return;
-        }
-        
-        const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
-        T *new_data = static_cast<T*>(::operator new(sizeof(T)*new_cap));
-       
-        // why must this always be done before the moving/copying to new buffer ?
-        // to handle the case where we are moving, and value is one of the old elements of the vector
-        try {
-            ::new (new_data + size_) T(std::move(value));
-        } catch (...) {
-            ::operator delete(new_data);
-            // we don't need to take care of anything that's handled by the destructor.
-            throw;
-        }
-
-        try {
-            relocate_and_commit(new_data, new_cap);
-        } catch(...) {
-            new_data[size_].~T();
-            ::operator delete(new_data);
-            throw;
-        }
-
-        ++size_;
-    }
+    emplace_back(std::forward(value));
+}
 
     /*
     Rn, I did 2 different overloads of push_back: const T&, T&&:
@@ -394,7 +376,7 @@ public:
 
     void pop_back() {
         --size_; // better, prevents dbl destructor call on dtor throw
-        data_[size_-1].~T();
+        data_[size_].~T();
         // --size_; // still valid, since dtors aren't supposed to throw
     }
 
@@ -422,7 +404,6 @@ public:
     v[6] = 29;
 
     */
-
 };
 
 }
