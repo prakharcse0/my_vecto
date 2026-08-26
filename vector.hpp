@@ -1,9 +1,13 @@
+#ifndef MYSTD_VECTOR_HPP
+#define MYSTD_VECTOR_HPP
+
 #include <algorithm>
 #include <cstddef>
 #include <new>
 #include <stdexcept>
 #include <utility>
 
+#include "guards.hpp"
 
 namespace mystd {
 // vector invariants:
@@ -59,6 +63,10 @@ void f() {
 // stl requires element types to satisfy:
 // u.~T() — all resources are reclaimed, no exception is propagated.
 
+// Cleanup is now handled by RAII guards from guards.hpp rather than try/catch:
+// a guard's destructor runs during unwinding, so cleanup is the DEFAULT and
+// release() on the success path is what cancels it. See guards.hpp.
+
 template <class T>
 class vector {
     T* data_ = nullptr;
@@ -67,29 +75,27 @@ class vector {
 
    void relocate_and_commit(T* dest, std::size_t new_cap) {
         // strong gaurantee
-        for(std::size_t i = 0; i < size_; ++i) {
-            // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
-            // even copy throws (eactually more then move, then why move only on move_if_noexcept)
-            // becasue even if copy throws, the original is not destroyed, it's recoverable
-            try {
-                ::new (dest + i) T(std::move_if_noexcept(data_[i]));
-            } catch (...) {
-                // we don't need to take care of anything that's handled by the destructor.
-                for (std::size_t j = 0; j < i; ++j)
-                    dest[j].~T();
-                // ::operator delete(dest); // why not do this here ?
-                // bca this function doesn't own dest
-                // for ex : incase push_back is calling, puch_back still needs to delete the element at the end
-                throw;
-            }
-        }
+        // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
+        // even copy throws (eactually more then move, then why move only on move_if_noexcept)
+        // becasue even if copy throws, the original is not destroyed, it's recoverable
+        //
+        // The guard destroys whatever was built into dest if a construction
+        // throws. It does NOT free dest: this function doesn't own that block.
+        // for ex : incase push_back is calling, push_back still needs to delete
+        // the element it already put at the end.
+        T* cur = dest;
+        detail::construct_guard<T> cg(dest, cur);
+        for (std::size_t i = 0; i < size_; ++i, ++cur)
+            ::new (cur) T(std::move_if_noexcept(data_[i]));
+        cg.release();
 
         // don't destroy in the same loop where you copy/move
         // why ??:
         // let's say you are copying, in midst, it throws a exception, reserve terminates, calling function handles it.
         // noww, you have half the elements of the current data_ destroyed
-        for(std::size_t i = 0; i < size_; ++i)
-            data_[i].~T();
+        //
+        // Everything below this point is noexcept -- this is the commit.
+        detail::destroy_range(data_, data_ + size_);
 
         ::operator delete(data_);
         data_ = dest;
@@ -101,53 +107,47 @@ class vector {
     template <class... Args>
     void resize_impl(std::size_t n, const Args&... args) {
         // strong gaurantee
+        //
+        // args is taken by const& (not forwarded): it is used once per new
+        // element, so it must not be moved from.
         if(size_ == n)
             return;
 
         if(size_ >= n) {
-            for(std::size_t i = n; i < size_; ++i)
-                data_[i].~T();
+            detail::destroy_range(data_ + n, data_ + size_);
             size_ = n;
             return;
         }
 
         if (cap_ < n) {
+            // Geometric, matching emplace_back. Exact allocation would make
+            // repeated resize(size()+1) quadratic.
             const std::size_t new_cap = std::max(n, cap_ * 2);
-            T* new_data = static_cast<T*>(::operator new(sizeof(T) * new_cap));
+            detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+            T* nb = ag.get();
 
-            std::size_t k = size_;
-            try {
-                for (; k < n; ++k)
-                    ::new (new_data + k) T(args...);
-            } catch (...) {
-                while (k > size_) new_data[--k].~T();
-                ::operator delete(new_data);
-                throw;
-            }
+            // 1. new elements FIRST -- args... may alias data_, still alive
+            T* k = nb + size_;
+            detail::construct_guard<T> kg(nb + size_, k);
+            for (; k != nb + n; ++k)
+                ::new (k) T(args...);
 
-            try {
-                relocate_and_commit(new_data, new_cap);
-            } catch (...) {
-                for (std::size_t j = size_; j < n; ++j) new_data[j].~T();
-                ::operator delete(new_data);
-                throw;
-            }
+            // 2. only now may the old buffer be touched
+            relocate_and_commit(nb, new_cap);
 
+            kg.release();
+            ag.release();
             size_ = n;
             return;
         }
 
-        std::size_t i = size_;
-        try {
-            for( ; i < n; ++i)
-                ::new (data_ + i) T(args...);
-        } catch(...) {
-            // while(--i >= size_) // don't, segfault if size_ equals 0 // slways be careful when doing >= size_
-            //     data_[i].~T();
-            while (i > size_) 
-                data_[--i].~T();
-            throw;
-        }
+        // Enough capacity: construct in place. args cannot dangle here,
+        // because nothing frees data_.
+        T* i = data_ + size_;
+        detail::construct_guard<T> g(data_ + size_, i);
+        for( ; i != data_ + n; ++i)
+            ::new (i) T(args...);
+        g.release();
 
         size_ = n;
     }
@@ -167,18 +167,19 @@ public:
         if(!other.size_)
             return;
 
-        data_ = static_cast<T*>(::operator new(sizeof(T) * other.size_));
-        try {
-            for(std::size_t i = 0; i < other.size_; ++i) {
-                ::new (data_ + i) T(other.data_[i]); // destructor can't handle this - since dtor isn't called if ctor throws. isn't completed
-                ++size_;
-            }
-        } catch(...) {
-            for(std::size_t i = 0; i < size_; ++i)
-                data_[i].~T();
-            ::operator delete(data_);
-            throw;
-        }
+        // No need to publish each element via ++size_ any more: the guards own
+        // the partial work until the commit. (The destructor still can't help
+        // here -- a dtor isn't called if the ctor throws.)
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(other.size_));
+        T* cur = ag.get();
+        detail::construct_guard<T> cg(ag.get(), cur);
+        for(std::size_t i = 0; i < other.size_; ++i, ++cur)
+            ::new (cur) T(other.data_[i]);
+        cg.release();
+
+        data_ = ag.get();
+        ag.release();
+        size_ = other.size_;
     }
 
     vector& operator=(const vector& other) {
@@ -206,29 +207,28 @@ public:
             for( ; i < size_; ++i) 
                 data_[i].~T();
 
-            size_ = other.size_; // noo // why ? // above
+            size_ = other.size_; // no-op when growing (size_ was tracked above);
+                                 // required when shrinking.
             return *this;
         }
 
-        T* new_data = static_cast<T*>(::operator new(sizeof(T) * other.size_));
-        std::size_t i = 0;
-        try {
-            for (; i < other.size_; ++i)
-                ::new (new_data + i) T(other.data_[i]);
-        } catch (...) {
-            while (i > 0) new_data[--i].~T();
-            ::operator delete(new_data);
-            throw;
-            // size_, cap_, data same as when called
-        }
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(other.size_));
+        T* cur = ag.get();
+        detail::construct_guard<T> cg(ag.get(), cur);
+        for (std::size_t i = 0; i < other.size_; ++i, ++cur)
+            ::new (cur) T(other.data_[i]);
+        cg.release();
+        // size_, cap_, data_ unchanged if anything above threw -> strong
 
-
-        for(std::size_t i = 0; i < size_; ++i)
-            data_[i].~T();
+        // Commit. Nothing below can throw.
+        detail::destroy_range(data_, data_ + size_);
         ::operator delete(data_);
-        // can't we just do ::delete data_ instead of above 4 lines ?
-        
-        data_ = new_data;
+        // can't we just do ::delete data_ instead of above 2 lines ?
+        // No: delete runs ~T() on ONE object then frees, and pairs with new,
+        // not with ::operator new. We need destroy and free kept separate.
+
+        data_ = ag.get();
+        ag.release();
         size_ = other.size_;
         this->cap_ = other.size_;
 
@@ -258,8 +258,7 @@ public:
 
         if (this == &other) return *this;        // self-move
 
-        for (std::size_t i = 0; i < size_; ++i) 
-            data_[i].~T();
+        detail::destroy_range(data_, data_ + size_);
         ::operator delete(data_);
 
         data_ = other.data_;
@@ -274,8 +273,7 @@ public:
     }
 
     ~vector() {
-        for(std::size_t i = 0; i < size_; ++i)
-            data_[i].~T();
+        detail::destroy_range(data_, data_ + size_);
         ::operator delete(data_);
     }
 
@@ -285,14 +283,9 @@ public:
         if(new_cap <= cap_)
             return;
 
-        T *new_data = static_cast<T*>(::operator new(sizeof(T)*new_cap)); // ::operator new returns void*, always cast
-
-        try {
-            relocate_and_commit(new_data, new_cap);
-        } catch(...) {
-            ::operator delete(new_data);
-            throw;
-        }
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        relocate_and_commit(ag.get(), new_cap);
+        ag.release();   // relocate_and_commit succeeded: the block is data_ now
     }
 
     void resize(std::size_t n) {
@@ -314,14 +307,9 @@ public:
             return;
         }
 
-        T *new_data = static_cast<T*>(::operator new(sizeof(T)*size_)); // ::operator new returns void*, always cast
-
-        try {
-            relocate_and_commit(new_data, size_);
-        } catch(...) {
-            ::operator delete(new_data);
-            throw;
-        }
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(size_));
+        relocate_and_commit(ag.get(), size_);
+        ag.release();
     }
 
     // class... Args — a template parameter pack: zero or more types, deduced per call.
@@ -339,22 +327,24 @@ public:
         }
         
         const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
-        T *new_data = static_cast<T*>(::operator new(sizeof(T)*new_cap));
-       
-        try {
-            ::new (new_data + size_) T(std::forward<Args>(args)...);
-        } catch (...) {
-            ::operator delete(new_data);
-            throw;
-        }
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        T* nb = ag.get();
 
-        try {
-            relocate_and_commit(new_data, new_cap);
-        } catch(...) {
-            new_data[size_].~T();
-            ::operator delete(new_data);
-            throw;
-        }
+        // why must this always be done before the moving/copying to new buffer ?
+        // to handle the case where we are moving, and value is one of the old
+        // elements of the vector. The old buffer is still intact here.
+        T* hole = nb + size_;
+        detail::construct_guard<T> hg(nb + size_, hole);
+        ::new (hole) T(std::forward<Args>(args)...);
+        ++hole;
+
+        // Two disjoint live ranges now exist in nb: the prefix relocate_and_commit
+        // is about to build at [0, size_), and the new element at [size_, size_+1).
+        // Each has its own guard; neither has to know about the other.
+        relocate_and_commit(nb, new_cap);
+
+        hg.release();
+        ag.release();
 
         ++size_;
         return data_[size_ - 1];
@@ -362,13 +352,17 @@ public:
 
     void push_back(const T& value) {
         // does it add extra cost of an extra function call
-        // Zero cost at -O2: GCC inlines emplace_back
+        // Zero cost from -O1 up: GCC inlines push_back into its caller and
+        // emplace_back with it. Exception: copy-constructing an allocating type
+        // at -O1 (push_back(const std::string&)) keeps one call, because the
+        // copy ctor's EH machinery exceeds the inliner's budget. -O2 handles it.
+        // Measured with objdump -dr, not assumed.
         emplace_back(value);
     }
 
     void push_back(T&& value) {
-      emplace_back(std::forward(value));
-}
+        emplace_back(std::move(value));
+    }
 
     /*
     Rn, I did 2 different overloads of push_back: const T&, T&&:
@@ -387,6 +381,10 @@ public:
     }
     in case of rvalue: 1 move ctor (when T x is constructed outta the rvalue arg) / or 0 due to copy elision + 1 move ctor (when the new data_ element is contructed outta x)
     in case of lvalue: 1 copy ctor (when T x is copy constructed outta the lvalue arg) + 1 move ctor (when the new data_ element is contructed outta x)
+
+    The real argument against by-value isn't the extra move: x is a full
+    materialised T on the stack, so for vector<array<char,4096>> you memcpy 4 KB
+    through a parameter on every push.
 
     */
 
@@ -452,9 +450,7 @@ public:
     }
 
     void clear() noexcept {
-        for(std::size_t i = 0; i < size_; ++i) {
-            data_[i].~T();
-        }
+        detail::destroy_range(data_, data_ + size_);
         size_ = 0;
     }
 
@@ -491,3 +487,5 @@ public:
 };
 
 }
+
+#endif  // MYSTD_VECTOR_HPP
