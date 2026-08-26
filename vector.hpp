@@ -66,6 +66,7 @@ class vector {
     std::size_t cap_ = 0;
 
    void relocate_and_commit(T* dest, std::size_t new_cap) {
+        // strong gaurantee
         for(std::size_t i = 0; i < size_; ++i) {
             // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
             // even copy throws (eactually more then move, then why move only on move_if_noexcept)
@@ -95,6 +96,60 @@ class vector {
         cap_ = new_cap; // must be done only after new_data is safely created/assigned, and data_ is safely updated;
         // else, if the program throws while doing the above, and caller catches it, you're in an broken invariant state
         // issue on further push_back() / destruction / anything
+    }
+
+    template <class... Args>
+    void resize_impl(std::size_t n, const Args&... args) {
+        // strong gaurantee
+        if(size_ == n)
+            return;
+
+        if(size_ >= n) {
+            for(std::size_t i = n; i < size_; ++i)
+                data_[i].~T();
+            size_ = n;
+            return;
+        }
+
+        if (cap_ < n) {
+            const std::size_t new_cap = std::max(n, cap_ * 2);
+            T* new_data = static_cast<T*>(::operator new(sizeof(T) * new_cap));
+
+            std::size_t k = size_;
+            try {
+                for (; k < n; ++k)
+                    ::new (new_data + k) T(args...);
+            } catch (...) {
+                while (k > size_) new_data[--k].~T();
+                ::operator delete(new_data);
+                throw;
+            }
+
+            try {
+                relocate_and_commit(new_data, new_cap);
+            } catch (...) {
+                for (std::size_t j = size_; j < n; ++j) new_data[j].~T();
+                ::operator delete(new_data);
+                throw;
+            }
+
+            size_ = n;
+            return;
+        }
+
+        std::size_t i = size_;
+        try {
+            for( ; i < n; ++i)
+                ::new (data_ + i) T(args...);
+        } catch(...) {
+            // while(--i >= size_) // don't, segfault if size_ equals 0 // slways be careful when doing >= size_
+            //     data_[i].~T();
+            while (i > size_) 
+                data_[--i].~T();
+            throw;
+        }
+
+        size_ = n;
     }
 
 public:
@@ -240,6 +295,35 @@ public:
         }
     }
 
+    void resize(std::size_t n) {
+        resize_impl(n);
+    }
+
+    void resize(std::size_t n, const T& value) {
+        resize_impl(n, value);
+    }
+
+    void shrink_to_fit() {
+        if(cap_ == size_)
+            return;
+
+        if (size_ == 0) {
+            ::operator delete(data_);
+            data_ = nullptr;
+            cap_ = 0;
+            return;
+        }
+
+        T *new_data = static_cast<T*>(::operator new(sizeof(T)*size_)); // ::operator new returns void*, always cast
+
+        try {
+            relocate_and_commit(new_data, size_);
+        } catch(...) {
+            ::operator delete(new_data);
+            throw;
+        }
+    }
+
     // class... Args — a template parameter pack: zero or more types, deduced per call.
     // Args&& — a forwarding reference (aka "universal reference"), not an rvalue reference.
     // args... — pack expansion at the call site.
@@ -283,7 +367,7 @@ public:
     }
 
     void push_back(T&& value) {
-    emplace_back(std::forward(value));
+      emplace_back(std::forward(value));
 }
 
     /*
