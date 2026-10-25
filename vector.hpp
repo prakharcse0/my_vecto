@@ -2,12 +2,16 @@
 #define MYSTD_VECTOR_HPP
 
 #include <algorithm>
+#include <compare>
 #include <cstddef>
+#include <iterator>
 #include <new>
 #include <stdexcept>
 #include <utility>
 
 #include "guards.hpp"
+#include <type_traits>
+
 
 namespace mystd {
 // vector invariants:
@@ -153,6 +157,263 @@ class vector {
     }
 
 public:
+
+    template<bool isConst>
+    class basic_iterator {
+        using Elem = std::conditional_t<isConst, const T, T>;
+        Elem *p_ = nullptr;
+        explicit basic_iterator(Elem *p) : p_(p) {}
+    public:
+        // Signed and pointer-wide, i.e. what raw pointer subtraction gives.
+        //   - not size_t: begin() - end() is negative, unsigned would wrap
+        //   - not int: 32 bits, overflows past 2^31 elements
+        // Also the type of n in it + n, it += n, it[n], so it + (-1) works.
+        using difference_type = std::ptrdiff_t;
+
+        // The type of a COPY of an element, so always T, never const T --
+        // a copy of a const element is yours to modify. Same as raw pointers:
+        // iter_value_t<const int*> is int. The library would NOT catch const T
+        // here: iter_value_t and iterator_traits strip cv from the member, so
+        // the concepts still pass (measured). Only code reading
+        // It::value_type directly would get a const copy it can't assign to.
+        // Without it the library can't name "a copy of an element" (std::sort
+        // needs one for its pivot), so iterator_traits<It> is EMPTY and even
+        // std::find fails to compile.
+        using value_type = T;
+
+        // Claims the top tier. Operators can prove random access, but not
+        // that elements sit next to each other in memory -- that has to be
+        // declared. Without it ITER_CONCEPT falls back to random_access.
+        // Only read by C++20 concepts; classic algorithms read
+        // iterator_traits<It>::iterator_category, which C++20 derives as
+        // random_access_iterator_tag on its own (C++98 had no contiguous tag).
+        using iterator_concept = std::contiguous_iterator_tag;
+
+        // ex:
+        // template <class It>
+        // typename std::iterator_traits<It>::difference_type
+        // distance(It first, It last) {
+        //     using cat = typename std::iterator_traits<It>::iterator_category;
+        //     return distance_impl(first, last, cat{});     // pick an implementation by TYPE
+        // }
+
+        // // two implementations; overload resolution chooses one at compile time
+        // template <class It>
+        // auto distance_impl(It first, It last, std::input_iterator_tag) {
+        //     typename std::iterator_traits<It>::difference_type n = 0;
+        //     while (first != last) { ++first; ++n; }       // O(n): walk
+        //     return n;
+        // }
+        // template <class It>
+        // auto distance_impl(It first, It last, std::random_access_iterator_tag) {
+        //     return last - first;                          // O(1): subtract
+        // }
+
+        // Not declared:
+        //   - iterator_category, reference, pointer: C++20 iterator_traits
+        //     derives them from the operators (random_access tag, Elem&,
+        //     decltype(operator->())), so writing them would only restate
+        //     them, with a chance to disagree
+        //   - element_type: read by pointer_traits, not needed by
+        //     std::to_address on GCC 13 -- operator-> is what it uses
+
+        basic_iterator(const basic_iterator<false>& it) requires isConst : p_(it.p_) {}
+        // if we just left it at the above:
+        //                         default ctor     copy ctor       move ctor
+        // basic_iterator<false>    suppressed      suppressed      suppressed
+        // basic_iterator<true>	    suppressed      generated       generated
+
+        basic_iterator() = default;
+        basic_iterator(const basic_iterator&) = default;
+        // why is this required ?
+        // bcz of how requires works
+        // requires is unlike if constexpr
+        //   - requires does NOT remove the declaration; it only makes it
+        //     non-viable in overload resolution when the constraint is false
+        //   - so in basic_iterator<false>, the ctor above is still DECLARED, and
+        //     its signature (const basic_iterator<false>&) makes it a copy ctor
+        //   - a declared copy ctor (even an unusable one) stops the compiler
+        //     from generating the implicit copy/move ctors -> <false> uncopyable
+        //   - so we declare the real copy ctor ourselves; the constrained one
+        //     drops out, this one is used, and it stays trivial
+        //   (if constexpr only discards statements inside function bodies,
+        //    so it can't control whether a member exists at all)
+
+        // declaring the copy ctor leaves copy assignment as deprecated:
+        basic_iterator& operator=(const basic_iterator&) = default;
+        // declaring the copy ctor stops the implicit move ops,
+        // but doesn't matter here, since copy costs same as move here
+        
+        // basic_iterator(basic_iterator&&) = default;
+        // basic_iterator& operator=(basic_iterator&&) = default;
+        
+        // Not declared (case here): moves quietly become copies. is_move_constructible_v<It> and is_move_assignable_v<It> are still true, because they only ask "can I construct or assign from an rvalue?" and the copy operations answer yes. 
+        // basic_iterator(basic_iterator&&): the ctor is deleted, so std::move(a) would fail to compile. 
+
+
+        // Rule of five: if you write any of the destructor, copy operations, or move operations because you manage a resource, write or = default all five.
+
+        // Default constructor is generated only if you declare no constructors at all, of any kind: copy, move, converting, templated, constrained, anything.
+
+        // Copy constructor is generated unless you declare one yourself. 
+        // If you declare a move constructor or move assignment, the generated copy constructor is deleted. 
+        // If you declare a copy assignment or destructor, it’s still generated, but that’s deprecated (GCC’s -Wdeprecated-copy).
+
+        // Copy assignment follows the same pattern as the copy constructor. 
+        // Declaring a move constructor or move assignment makes it deleted. 
+        // Declaring a copy constructor or destructor leaves it generated but deprecated.
+
+        // Move constructor is generated only if you declare none of: copy constructor, copy assignment, move assignment, destructor.
+
+        // Move assignment is generated only if you declare none of: copy constructor, copy assignment, move constructor, destructor.
+
+        // Destructor is always generated unless you declare one.
+
+        Elem& operator*() const {
+            return *p_;
+        }
+
+        // it->m for class elements, e.g. strings.begin()->size().
+        // Returns Elem*, so through a const_iterator you get const T* and
+        // can only call const members.
+        // Also how std::to_address(it) turns an iterator into a raw pointer,
+        // which contiguous_iterator requires. Unlike &*it it never
+        // dereferences, so it is valid on end() too.
+        Elem* operator->() const noexcept {
+            return p_;
+        }
+
+        // Rejected:
+        // 1.  bool operator==(const basic_iterator& o) const;
+        //     bool operator==(const basic_iterator<!isConst>& o) const { return p_ == o.p_; }
+        //     cross-type overload (It vs CIt): restates the It -> CIt conversion
+        //     we already have, and has to be repeated for <=> and it - cit
+
+        // 2.  bool operator==(const basic_iterator& o) const;
+        //     member operator==: `this` is never converted, so it == cit only
+        //     compiles thanks to C++20's reversed candidates (fails in C++17)
+
+        // Equality: hidden friend, same-type only.
+        //   - it == cit works by converting it -> const_iterator through the
+        //     converting ctor above; a free function may convert EITHER operand
+        //   - hidden: found only by ADL, when an argument is a basic_iterator
+        //   - != is free in C++20: a != b is rewritten as !(a == b)
+        friend bool operator==(const basic_iterator& a, const basic_iterator& b) noexcept { // = default
+            return a.p_ == b.p_;
+        }
+        // A function defined inside a class with friend is special: ordinary lookup can never see it, not even from inside the same namespace. Only ADL finds it, and only when one of the arguments has that class type (or the class is associated with an argument's type).
+        // No accidental matches. If some unrelated type could convert to basic_iterator, comparing two of those wouldn't pick your ==, because neither argument's type leads ADL to your class.
+        // Smaller overload sets. Every other == in your program doesn't have to consider and reject it, which means faster compiles and shorter error messages.
+
+        // Ordering: hidden friend, same-type only -- same reasoning as ==.
+        //   - < <= > >= are rewritten as (a <=> b) < 0 etc.; == is NOT derived
+        //     from <=>, so the == above stays
+        //   - it < cit converts it -> const_iterator, exactly like ==
+        //   - strong_ordering: pointer <=> already yields it; spelled out
+        //     rather than auto so the category is part of the interface
+        //   - only meaningful for iterators into the same vector, same as
+        //     comparing raw pointers into different arrays
+        // Not done:
+        //   - = default: also correct today (p_ is the only member), but kept
+        //     by hand to match ==, so both state exactly what is compared
+        //   - weak/partial_ordering: two iterators to the same slot are
+        //     interchangeable, and every pair in one vector is comparable
+        friend std::strong_ordering operator<=>(const basic_iterator& a, const basic_iterator& b) noexcept { // = default;
+            return a.p_ <=> b.p_;
+        }
+        
+        basic_iterator& operator++() {
+            // if(p == data+size_)
+            //     throw exception;
+            ++p_;
+            return *this;
+        }
+
+        basic_iterator operator++(int) noexcept {
+            basic_iterator old = *this;
+            ++*this;
+            return old;
+        }
+
+        basic_iterator& operator--() noexcept {
+            --p_;
+            return *this;
+        }
+
+        basic_iterator operator--(int) noexcept {
+            basic_iterator old = *this;
+            --*this;
+            return old;
+        }
+
+        basic_iterator& operator+=(difference_type n) noexcept {
+            p_ += n;
+            return *this;
+        }
+
+        // Not `return *this += -n;`: -n overflows (UB) when n is PTRDIFF_MIN.
+        basic_iterator& operator-=(difference_type n) noexcept {
+            p_ -= n;
+            return *this;
+        }
+
+        // const member returning Elem&, same as operator*: constness of the
+        // ITERATOR (can't move it) is not constness of the ELEMENT -- like
+        // T* const vs const T*. Only Elem decides whether you can write.
+        // No bounds check, same as operator* and raw pointers.
+        Elem& operator[](difference_type n) const noexcept {
+            return p_[n];
+        }
+
+        // Binary + and -: hidden friends, built on += / -=.
+        //   - n + it HAS to be a non-member: the left operand is an integer,
+        //     and you can't add members to ptrdiff_t
+        //   - it + n, it - n could be members; friends to keep the family
+        //     uniform (one place, one lookup rule)
+        //   - `it` taken BY VALUE: the parameter is already the copy we
+        //     return, so no separate local
+        //   - there is no n - it: "5 minus an iterator" means nothing
+        friend basic_iterator operator+(basic_iterator it, difference_type n) noexcept {
+            it += n;
+            return it;
+        }
+
+        friend basic_iterator operator+(difference_type n, basic_iterator it) noexcept {
+            it += n;
+            return it;
+        }
+
+        friend basic_iterator operator-(basic_iterator it, difference_type n) noexcept {
+            it -= n;
+            return it;
+        }
+
+        // Distance: hidden friend, same-type only, and here that is REQUIRED,
+        // not style. As a member, it - cit fails (`this` is never converted),
+        // and unlike == / <=> C++20 has no reversed candidates for -.
+        // As a friend, it - cit converts it -> const_iterator like ==.
+        friend difference_type operator-(const basic_iterator& a, const basic_iterator& b) noexcept {
+            return a.p_ - b.p_;
+        }
+
+        friend class vector;
+        friend class basic_iterator<!isConst>;   // the const twin reads p_ for the conversion
+        // works even without this since friendship is achieved anyways through vector's frienship, but better
+    };
+
+    using iterator = basic_iterator<false>;
+    using const_iterator = basic_iterator<true>;
+
+    // Reverse iteration is an ADAPTER over the forward iterators, not a
+    // third iterator class: std::reverse_iterator flips ++/--, +/-, < / >,
+    // and gets everything else (traits, It -> CIt conversion, mixed ==)
+    // from what basic_iterator already does.
+    // The std:: qualifier matters: inside this class (and in every member
+    // function body, even ones above this line) plain `reverse_iterator`
+    // names the member alias, not the std template.
+    using reverse_iterator       = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
 
     vector() noexcept = default;
 
@@ -484,6 +745,45 @@ public:
     v[6] = 29;
 
     */
+
+    iterator begin() {
+        return iterator(data_);
+    }
+
+    iterator end() {
+        return iterator(data_+size_);
+    }
+
+    const_iterator begin() const {
+        return const_iterator(data_);
+    }
+
+    const_iterator end() const {
+        return const_iterator(data_+size_);
+    }
+
+    // cbegin/cend: a const_iterator from a NON-const vector, without a cast.
+    //   - `auto it = v.cbegin();` says "read-only" at the call site
+    //   - insert/erase (step 6) take const_iterator positions
+    // Delegating: inside a const member *this is const, so begin() already
+    // picks the const overload. One construction site, nothing to drift.
+    const_iterator cbegin() const noexcept { return begin(); }
+    const_iterator cend()   const noexcept { return end(); }
+
+    // Reverse: rbegin wraps end(), rend wraps begin() -- NOT end()-1 and
+    // begin()-1. reverse_iterator stores a base and dereferences the slot
+    // BEFORE it (*r == *std::prev(r.base())), so:
+    //   - begin()-1 is never formed: a pointer before the array is UB even
+    //     if never dereferenced, and on an empty vector data_ is null
+    //   - empty vector: rbegin() == rend() because end() == begin()
+    //   - r.base() converts back to a forward iterator one past the element,
+    //     which is exactly the position erase/insert want (step 6)
+    reverse_iterator       rbegin()        noexcept { return reverse_iterator(end()); }
+    reverse_iterator       rend()          noexcept { return reverse_iterator(begin()); }
+    const_reverse_iterator rbegin()  const noexcept { return const_reverse_iterator(end()); }
+    const_reverse_iterator rend()    const noexcept { return const_reverse_iterator(begin()); }
+    const_reverse_iterator crbegin() const noexcept { return rbegin(); }
+    const_reverse_iterator crend()   const noexcept { return rend(); }
 };
 
 }
