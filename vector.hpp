@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <compare>
 #include <cstddef>
+#include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -77,7 +79,21 @@ class vector {
     std::size_t size_ = 0;
     std::size_t cap_ = 0;
 
+   // No gap: reserve, shrink_to_fit, resize, emplace_back (whose new element
+   // sits at dest[size_], just past the prefix -- a gap at the end needs no
+   // room left inside the relocated range).
    void relocate_and_commit(T* dest, std::size_t new_cap) {
+        relocate_and_commit(dest, new_cap, size_, 0);
+   }
+
+   // Relocate around a gap: [0, gap_at) -> dest[0, gap_at),
+   //                        [gap_at, size_) -> dest[gap_at + gap_len, ...).
+   // The CALLER has already constructed whatever goes in the gap (aliasing:
+   // args may refer to old elements, which are only still alive before this),
+   // guards it, and updates size_ afterwards. This function never touches
+   // the gap and never changes size_.
+   void relocate_and_commit(T* dest, std::size_t new_cap,
+                            std::size_t gap_at, std::size_t gap_len) {
         // strong gaurantee
         // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
         // even copy throws (eactually more then move, then why move only on move_if_noexcept)
@@ -89,8 +105,18 @@ class vector {
         // the element it already put at the end.
         T* cur = dest;
         detail::construct_guard<T> cg(dest, cur);
-        for (std::size_t i = 0; i < size_; ++i, ++cur)
+        for (std::size_t i = 0; i < gap_at; ++i, ++cur)
             ::new (cur) T(std::move_if_noexcept(data_[i]));
+
+        // The suffix is a SECOND live range, separated from the prefix by the
+        // gap, so it needs its own guard. If a suffix construction throws,
+        // sg destroys the suffix built so far, then cg (still armed) the
+        // whole prefix, then the caller's guard the gap: three ranges.
+        T* scur = dest + gap_at + gap_len;
+        detail::construct_guard<T> sg(scur, scur);
+        for (std::size_t i = gap_at; i < size_; ++i, ++scur)
+            ::new (scur) T(std::move_if_noexcept(data_[i]));
+        sg.release();
         cg.release();
 
         // don't destroy in the same loop where you copy/move
@@ -106,6 +132,73 @@ class vector {
         cap_ = new_cap; // must be done only after new_data is safely created/assigned, and data_ is safely updated;
         // else, if the program throws while doing the above, and caller catches it, you're in an broken invariant state
         // issue on further push_back() / destruction / anything
+    }
+
+    // Capacity for inserting n more: size_ + max(size_, n), as libstdc++.
+    // Throws if size_ + n would wrap round (we'd allocate too little).
+    std::size_t grown_cap(std::size_t n) const {
+        if(n > std::numeric_limits<std::size_t>::max() - size_)
+            throw std::length_error("mystd::vector::insert: too many elements");
+        return size_ + std::max(size_, n);
+    }
+
+    // insert(pos, first, last)'s work, once n is known: n elements read
+    // from first, inserted at index. It must be MULTI-PASS: the n > tail
+    // case reads the range in two pieces (std::next to the split point).
+    // Each element is read exactly once, so a move_iterator is fine.
+    // Same structure as insert(pos, n, value), with *first in place of
+    // copy. No aliasing temporary: the range may not point into *this.
+    template <class It>
+    void insert_counted(std::size_t index, It first, std::size_t n) {
+        if(n == 0)
+            return;
+
+        if(n <= cap_ - size_) {
+            const std::size_t old_size = size_;
+            const std::size_t tail = old_size - index;
+            if(n <= tail) {
+                while(size_ < old_size + n) {
+                    ::new (data_ + size_) T(std::move(data_[size_ - n]));
+                    ++size_;
+                }
+                for(std::size_t i = old_size - n; i > index; --i)
+                    data_[i - 1 + n] = std::move(data_[i - 1]);
+                for(std::size_t i = index; i < index + n; ++i, ++first)
+                    data_[i] = *first;
+            }
+            else {
+                // range = [first, mid) -> old tail slots (assign)
+                //         [mid, ...)   -> raw [old_size, index + n) (construct)
+                It mid = std::next(first, static_cast<std::iter_difference_t<It>>(tail));
+                for(; size_ < index + n; ++mid) {
+                    ::new (data_ + size_) T(*mid);
+                    ++size_;
+                }
+                for(std::size_t i = index; i < old_size; ++i) {
+                    ::new (data_ + size_) T(std::move(data_[i]));
+                    ++size_;
+                }
+                for(std::size_t i = index; i < old_size; ++i, ++first)
+                    data_[i] = *first;
+            }
+            return;
+        }
+
+        const std::size_t new_cap = grown_cap(n);
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        T* nb = ag.get();
+
+        T* hole = nb + index;
+        detail::construct_guard<T> hg(nb + index, hole);
+        for(; hole != nb + index + n; ++hole, ++first)
+            ::new (hole) T(*first);
+
+        relocate_and_commit(nb, new_cap, index, n);
+
+        hg.release();
+        ag.release();
+
+        size_ += n;
     }
 
     template <class... Args>
@@ -162,7 +255,7 @@ public:
     class basic_iterator {
         using Elem = std::conditional_t<isConst, const T, T>;
         Elem *p_ = nullptr;
-        explicit basic_iterator(Elem *p) : p_(p) {}
+        explicit basic_iterator(Elem *p) noexcept : p_(p) {}
     public:
         // Signed and pointer-wide, i.e. what raw pointer subtraction gives.
         //   - not size_t: begin() - end() is negative, unsigned would wrap
@@ -217,7 +310,7 @@ public:
         //   - element_type: read by pointer_traits, not needed by
         //     std::to_address on GCC 13 -- operator-> is what it uses
 
-        basic_iterator(const basic_iterator<false>& it) requires isConst : p_(it.p_) {}
+        basic_iterator(const basic_iterator<false>& it) noexcept requires isConst : p_(it.p_) {}
         // if we just left it at the above:
         //                         default ctor     copy ctor       move ctor
         // basic_iterator<false>    suppressed      suppressed      suppressed
@@ -269,7 +362,7 @@ public:
 
         // Destructor is always generated unless you declare one.
 
-        Elem& operator*() const {
+        Elem& operator*() const noexcept {
             return *p_;
         }
 
@@ -322,7 +415,7 @@ public:
             return a.p_ <=> b.p_;
         }
         
-        basic_iterator& operator++() {
+        basic_iterator& operator++() noexcept {
             // if(p == data+size_)
             //     throw exception;
             ++p_;
@@ -746,19 +839,19 @@ public:
 
     */
 
-    iterator begin() {
+    iterator begin() noexcept {
         return iterator(data_);
     }
 
-    iterator end() {
+    iterator end() noexcept {
         return iterator(data_+size_);
     }
 
-    const_iterator begin() const {
+    const_iterator begin() const noexcept {
         return const_iterator(data_);
     }
 
-    const_iterator end() const {
+    const_iterator end() const noexcept {
         return const_iterator(data_+size_);
     }
 
@@ -776,15 +869,411 @@ public:
     //   - begin()-1 is never formed: a pointer before the array is UB even
     //     if never dereferenced, and on an empty vector data_ is null
     //   - empty vector: rbegin() == rend() because end() == begin()
-    //   - r.base() converts back to a forward iterator one past the element,
-    //     which is exactly the position erase/insert want (step 6)
+    //   - r.base() converts back to a forward iterator one PAST *r:
+    //       insert(r.base(), x) -> x lands right after *r (forward order),
+    //                              i.e. just before *r when walking reversed
+    //       erase(r.base())     -> WRONG element (or end(): UB). The element
+    //                              *r is at std::prev(r.base()), so
+    //                              v.erase(std::prev(r.base()))
     reverse_iterator       rbegin()        noexcept { return reverse_iterator(end()); }
     reverse_iterator       rend()          noexcept { return reverse_iterator(begin()); }
     const_reverse_iterator rbegin()  const noexcept { return const_reverse_iterator(end()); }
     const_reverse_iterator rend()    const noexcept { return const_reverse_iterator(begin()); }
     const_reverse_iterator crbegin() const noexcept { return rbegin(); }
     const_reverse_iterator crend()   const noexcept { return rend(); }
+
+    // =======================================================================
+    // Step 6: insert / erase. Declarations only -- bodies are TODO.
+    // (A member of a class template that is never called needs no
+    // definition, so this compiles as-is. Calling one before it is written
+    // is a LINK error: "undefined reference".)
+    //
+    // Common to all of them:
+    //   - positions are const_iterator; you must hand back an iterator.
+    //     There is no CIt -> It conversion (by design), so go via an index:
+    //     idx = pos - cbegin(); ... return begin() + idx;
+    //   - shifting LIVE slots is assignment (move-assign); filling RAW slots
+    //     in [size_, cap_) is construction (placement new). Never assign
+    //     into raw memory, never construct over a live object.
+    //   - allocation (allocate_raw) must happen BEFORE anything is modified:
+    //     bad_alloc / length_error must always leave the vector untouched.
+    //   - growth when it doesn't fit: new_cap = size_ + max(size_, n)
+    //     (libstdc++ stl_vector.h:1896), same spirit as resize's
+    //     max(n, cap_*2): geometric, but at least enough.
+    //
+    // Invalidation (iterators, pointers AND references):
+    //   insert/emplace, no realloc : before pos valid; at/after pos + end() invalid
+    //   insert/emplace, realloc    : everything invalid
+    //   erase                      : before first valid; at/after first + end() invalid
+    // ("invalid" here still points at valid memory -- just a DIFFERENT
+    //  element. A logic bug, not a crash; that's why debug iterators exist.)
+    //
+    // Exception guarantees the STANDARD gives. None of these is noexcept.
+    //   nothrow = cannot throw; strong = on throw, nothing changed;
+    //   basic (a.k.a. weak) = on throw, no leaks and invariants hold, but the
+    //   contents may have changed.
+    //
+    //   erase, both overloads         nothrow if T's move assign doesn't throw,
+    //                                 otherwise basic
+    //   any insert/emplace, alloc or
+    //   length failure                strong
+    //   ONE element at end()          strong if T is copyable or has a
+    //   (emplace, insert value)       noexcept move; a throwing move-only T
+    //                                 is unspecified
+    //   ONE element in the middle,    basic if T's copy/move/assign throws
+    //   insert(pos, n, value), range  (the at-end rule above covers ONE
+    //   and initializer_list insert   element only, so n copies at end() are
+    //                                 basic too)
+    //   range insert, iterator op     basic
+    //   throws
+    //
+    // Beyond the standard: libstdc++'s reallocating path is strong for
+    // copyable or noexcept-move T, because the old buffer is never touched.
+    //
+    // move_if_noexcept belongs ONLY to relocation into a NEW buffer: the old
+    // elements stay intact, so a throw can discard the new buffer. In-place
+    // shifts use plain std::move: the destination's old value is overwritten
+    // either way, so copying buys no rollback. (It also tests the move
+    // CONSTRUCTOR, not move assignment.)
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // erase(pos) -- remove *pos, shift [pos+1, end) left by one.
+    //   pre:    pos dereferenceable: in [begin, end), NOT end(). UB otherwise.
+    //   return: iterator to the element that followed the removed one
+    //           (end() if the last element was removed).
+    //   work:   exactly (end - pos - 1) move-ASSIGNMENTS, exactly 1 destructor
+    //           call. The standard specifies these counts; test them.
+    //   throws: nothing, unless T's move assignment throws -> BASIC
+    //           (no leak, invariants hold, contents partly shifted).
+    //           Never allocates. Not noexcept in std (it can throw via T).
+    //   aliasing: none possible -- no value argument.
+    // -----------------------------------------------------------------------
+    iterator erase(const_iterator pos) {
+        const std::size_t index = pos - cbegin();
+
+        // Shift first: the only step that can throw, and assignment keeps
+        // every slot in [0, size_) live, so a throw leaves the invariants
+        // intact. Plain std::move: *pos is overwritten either way, so a copy
+        // buys no rollback.
+        for(std::size_t i = index + 1; i < size_; ++i)
+            data_[i-1] = std::move(data_[i]);
+
+        // The leftover moved-from object is the LAST slot, not *pos.
+        // Same as pop_back: decrement before destroying.
+        --size_;
+        data_[size_].~T();
+
+        return begin() + index;
+    }
+
+    // -----------------------------------------------------------------------
+    // erase(first, last) -- remove [first, last), shift the tail left.
+    //   pre:    [first, last) a valid range of THIS vector (first <= last).
+    //   return: iterator at first's index after the shift (the element that
+    //           followed the removed range, or end()). first == last: no-op,
+    //           returns last (converted to iterator).
+    //   work:   (end - last) move-assignments, (last - first) destructors.
+    //   throws: as erase(pos) -- basic if T's move assign throws.
+    //   publishing rule: destroy the trailing slots and shrink size_ so
+    //           [0, size_) never names a destroyed object.
+    // -----------------------------------------------------------------------
+    iterator erase(const_iterator first, const_iterator last) {
+        const std::size_t start_index = first - cbegin();
+        const std::size_t end_index = last - cbegin();
+        const std::size_t count = end_index - start_index;
+
+        // Not just an optimisation: with count == 0 the loop below would
+        // self-move-assign every tail element, and a moved-from element is
+        // valid but unspecified, so a no-op could wreck the contents.
+        if(count == 0)
+            return begin() + start_index;
+
+        for(std::size_t i = 0; end_index + i < size_; ++i)
+            data_[start_index + i] = std::move(data_[end_index + i]);
+
+        // The count leftover moved-from objects are the LAST count slots.
+        // Decrement before destroying, so size_ never names a dead object.
+        const std::size_t old_size = size_;
+        size_ -= count;
+        detail::destroy_range(data_ + size_, data_ + old_size);
+
+        return begin() + start_index;
+    }
+
+    // -----------------------------------------------------------------------
+    // emplace(pos, args...) -- construct T(std::forward<Args>(args)...) and
+    // insert it before pos.
+    //   pre:    pos in [begin, end] (end() allowed: same as emplace_back).
+    //   return: iterator to the new element.
+    //   three paths:
+    //     a) room, pos == end : construct in place at data_[size_]
+    //     b) room, middle     : last element move-CONSTRUCTED into the raw
+    //                           slot, the rest move-ASSIGNED right by one,
+    //                           new value ASSIGNED into *pos
+    //     c) no room          : new buffer; construct the new element at its
+    //                           gap FIRST (aliasing), then relocate prefix
+    //                           and suffix with move_if_noexcept, commit
+    //   throws:
+    //     bad_alloc / length_error           : STRONG (nothing changed)
+    //     path a                              : STRONG (= emplace_back)
+    //     path c                              : std promises basic mid-vector;
+    //                                           libstdc++ gives STRONG (old
+    //                                           buffer never touched) unless
+    //                                           T is move-only with a throwing
+    //                                           move. Aim for the same.
+    //     path b, T's move ctor/assign throws : BASIC
+    //   aliasing: args may refer to elements of *this, e.g.
+    //           v.emplace(v.begin(), v.back()). Must work. libstdc++ path b
+    //           builds a TEMPORARY T first, then move-assigns it into *pos
+    //           (vector.tcc:397-401) -- and not only for aliasing: why can't
+    //           you destroy *pos and construct straight into it?
+    //   known hole (same as emplace_back, same as std): emplace(p,
+    //           std::move(v[i])) may plunder before a rollback.
+    // -----------------------------------------------------------------------
+    template <class... Args>
+    iterator emplace(const_iterator pos, Args&&... args) {
+        // An index, not pos: path c frees the buffer pos points into.
+        const std::size_t index = pos - cbegin();
+
+        if (size_ != cap_) {
+            // a) at the end: nothing to shift, construct straight into raw.
+            if (index == size_) {
+                ::new (data_ + size_) T(std::forward<Args>(args)...);
+                ++size_;
+                return begin() + index;
+            }
+
+            // b) middle. Build the new value FIRST, in a temporary:
+            //   - aliasing: args may refer to an element the shift moves.
+            //   - if T's constructor throws, nothing has changed: STRONG.
+            //   - *pos can't be destroyed + reconstructed: if that ctor threw,
+            //     a dead slot would sit inside [0, size_) and ~vector would
+            //     destroy it a second time.
+            T tmp(std::forward<Args>(args)...);
+
+            // The last element goes into the raw slot: CONSTRUCTION. Publish
+            // it at once, so that if an assignment below throws, ~vector
+            // still destroys it (every slot in [0, size_) stays live).
+            ::new (data_ + size_) T(std::move(data_[size_ - 1]));
+            ++size_;
+
+            // The rest shift right by one, back to front, by ASSIGNMENT
+            // (those slots are live). i > index, so i - 1 never underflows.
+            for (std::size_t i = size_ - 2; i > index; --i)
+                data_[i] = std::move(data_[i - 1]);
+
+            data_[index] = std::move(tmp);
+            return begin() + index;
+        }
+
+        // c) no room. size_ + max(size_, n) with n = 1: here size_ == cap_,
+        // so it's the same doubling as emplace_back.
+        const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        T* nb = ag.get();
+
+        // New element FIRST, into its gap -- the old buffer (which args may
+        // point into) is still intact. Same reasoning as emplace_back.
+        T* hole = nb + index;
+        detail::construct_guard<T> hg(nb + index, hole);
+        ::new (hole) T(std::forward<Args>(args)...);
+        ++hole;
+
+        relocate_and_commit(nb, new_cap, index, 1);
+
+        hg.release();
+        ag.release();
+
+        ++size_;
+        return begin() + index;
+    }
+
+    // -----------------------------------------------------------------------
+    // insert(pos, value) -- copy / move one element in before pos.
+    //   Everything as emplace(pos, value) / emplace(pos, std::move(value)):
+    //   delegate, exactly like push_back -> emplace_back.
+    //   aliasing: v.insert(v.begin(), v.back()) must work (handled by
+    //   emplace). The T&& one: std::move(value), not std::forward -- value
+    //   is a named rvalue ref, i.e. an lvalue (same as push_back).
+    // -----------------------------------------------------------------------
+    iterator insert(const_iterator pos, const T& value) {
+        return emplace(pos, value);
+    }
+    iterator insert(const_iterator pos, T&& value) {
+        return emplace(pos, std::move(value));
+    }
+
+    // -----------------------------------------------------------------------
+    // insert(pos, n, value) -- n copies of value before pos.
+    //   pre:    pos in [begin, end].
+    //   return: iterator to the first inserted copy; n == 0 -> pos (no-op).
+    //   work, room available, k = end - pos elements after pos -- draw it:
+    //     n <= k: move-CONSTRUCT the last n elements into raw [end, end+n),
+    //             move-ASSIGN (backward!) the other k-n right by n,
+    //             copy-ASSIGN value into [pos, pos+n)
+    //     n >  k: copy-CONSTRUCT n-k copies of value into raw [end, ...),
+    //             move-CONSTRUCT the k tail elements after those,
+    //             copy-ASSIGN value into the old [pos, end)
+    //     -> several disjoint raw regions: one construct_guard each.
+    //   no room: new buffer, construct the n copies at the gap FIRST,
+    //            relocate prefix + suffix, commit (as emplace path c).
+    //   throws: alloc failure STRONG; realloc path aim STRONG; in-place BASIC.
+    //   aliasing: value may be an element of *this, even one being shifted
+    //           (v.insert(v.begin(), 3, v[1])). libstdc++ copies it into a
+    //           temporary first (vector.tcc:540).
+    // -----------------------------------------------------------------------
+    iterator insert(const_iterator pos, std::size_t n, const T& value) {
+        const std::size_t index = pos - cbegin();
+        if(n == 0)
+            return begin() + index;
+
+        // cap_ - size_ can't overflow; size_ + n can.
+        if(n <= cap_ - size_) {
+            // Aliasing: value may be an element the shift overwrites.
+            const T copy(value);
+            const std::size_t old_size = size_;
+            const std::size_t tail = old_size - index;  // elements after pos
+
+            // No construct_guard in this branch: every construction into raw
+            // is PUBLISHED at once (++size_), so on a throw ~vector owns it.
+            // Raw slots are filled in order, so [0, size_) never has a hole.
+            // That gives the basic guarantee, which is what std asks here.
+            if(n <= tail) {
+                // last n of the tail -> raw [old_size, old_size + n)
+                while(size_ < old_size + n) {
+                    ::new (data_ + size_) T(std::move(data_[size_ - n]));
+                    ++size_;
+                }
+                // rest of the tail right by n, back to front (live -> live)
+                for(std::size_t i = old_size - n; i > index; --i)
+                    data_[i - 1 + n] = std::move(data_[i - 1]);
+                // the n copies into [index, index + n), all live
+                for(std::size_t i = index; i < index + n; ++i)
+                    data_[i] = copy;
+            }
+            else {
+                // n - tail copies -> raw [old_size, index + n)
+                while(size_ < index + n) {
+                    ::new (data_ + size_) T(copy);
+                    ++size_;
+                }
+                // whole tail -> raw [index + n, old_size + n)
+                for(std::size_t i = index; i < old_size; ++i) {
+                    ::new (data_ + size_) T(std::move(data_[i]));
+                    ++size_;
+                }
+                // the other tail copies into the old tail slots (live)
+                for(std::size_t i = index; i < old_size; ++i)
+                    data_[i] = copy;
+            }
+            return begin() + index;
+        }
+
+        // No room. grown_cap throws if a huge n would wrap size_ + n round
+        // to a small number: we'd allocate too little and write past it.
+        const std::size_t new_cap = grown_cap(n);
+        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        T* nb = ag.get();
+
+        // n copies into the gap FIRST (value may live in the old buffer).
+        // move_if_noexcept, copy fallback, revert on throw: all already in
+        // relocate_and_commit -- only the gap length is new.
+        T* hole = nb + index;
+        detail::construct_guard<T> hg(nb + index, hole);
+        for(; hole != nb + index + n; ++hole)
+            ::new (hole) T(value);
+
+        relocate_and_commit(nb, new_cap, index, n);
+
+        hg.release();
+        ag.release();
+
+        size_ += n;
+        return begin() + index;
+    }
+
+    // -----------------------------------------------------------------------
+    // insert(pos, first, last) -- copy [first, last) in before pos.
+    //   pre:    [first, last) valid, and NOT iterators into *this (explicit
+    //           precondition in std: v.insert(v.begin(), v.begin(), v.end())
+    //           is UB). Single VALUES may alias; whole ranges may not.
+    //   return: iterator to the first inserted element; empty range -> pos.
+    //   constraint: unconstrained, v.insert(it, 3, 7) on vector<int>
+    //           deduces InputIt = int -- an EXACT match that beats
+    //           insert(pos, size_t, const T&) (int -> size_t is a
+    //           conversion). std::input_iterator<int> is false (int has no
+    //           operator*), so the template drops out and the fill
+    //           overload wins. libstdc++ does the same with the older
+    //           _RequireInputIter (checks iterator_category).
+    //   forward iterators (or better): n = std::distance(first, last) up
+    //           front, then the same region logic as insert(pos, n, value)
+    //           but constructing/assigning from *first++ instead of value.
+    //   input iterators (single pass, e.g. istream_iterator): n unknown.
+    //           libstdc++ (vector.tcc:730-746): pos == end -> emplace_back
+    //           one by one; otherwise read into a TEMPORARY vector, then
+    //           insert from it with move iterators. (Why not just insert
+    //           each one at pos?)
+    //   throws: alloc STRONG; exception from T's copy/move/assign or from
+    //           ANY iterator operation (++, *, ==) -> BASIC.
+    // -----------------------------------------------------------------------
+    template <std::input_iterator InputIt>
+    iterator insert(const_iterator pos, InputIt first, InputIt last) {
+        const std::size_t index = pos - cbegin();
+
+        if constexpr (std::forward_iterator<InputIt>) {
+            // multi-pass: count first, then one gap of exactly n
+            const auto n = static_cast<std::size_t>(std::distance(first, last));
+            insert_counted(index, first, n);
+        }
+        else if (index == size_) {
+            // single pass at the end: nothing to shift, append one by one
+            for(; first != last; ++first)
+                emplace_back(*first);
+        }
+        else {
+            // single pass in the middle: n is unknown until the range is
+            // used up. emplace-at-pos per element would shift the tail every
+            // time (O(n*k)), so read it all into a temporary first, then
+            // insert once, moving out of it. Bonus: an exception while
+            // READING the range (from *, ++, ==, or T's ctor) leaves *this
+            // untouched -- strong for that part.
+            vector tmp;
+            for(; first != last; ++first)
+                tmp.emplace_back(*first);
+            // insert_counted, not insert(pos, move_iterator...): no
+            // re-dispatch on the iterator's category (move_iterator was only
+            // input_iterator before P2520 -- that recursion would never end).
+            insert_counted(index, std::make_move_iterator(tmp.begin()), tmp.size());
+        }
+        return begin() + index;
+    }
+
+    // -----------------------------------------------------------------------
+    // insert(pos, {a, b, c}) -- one line: delegate to the range overload
+    // with il.begin(), il.end(). Needs <initializer_list> (not the
+    // initializer_list CONSTRUCTOR -- that's still deferred).
+    // initializer_list elements are const: you can only copy from them.
+    // -----------------------------------------------------------------------
+    iterator insert(const_iterator pos, std::initializer_list<T> il) {
+        return insert(pos, il.begin(), il.end());
+    }
 };
+
+// ---------------------------------------------------------------------------
+// Optional (C++20 free functions): std::erase / std::erase_if equivalents.
+//   erase(v, value)   : removes every element == value
+//   erase_if(v, pred) : removes every element where pred(e) is true
+//   return: number removed (vector::size_type)
+//   how:    remove-erase idiom -- std::remove_if compacts the keepers to the
+//           front (move-assign, O(n)), then the range erase above drops the
+//           tail. One pass, no allocation.
+//   throws: as erase -- basic if T's move assign (or pred, or ==) throws.
+//   spelled as hidden friends inside vector, or free functions here in
+//   mystd (found by ADL either way, since the argument is a mystd::vector).
+// template <class T, class U> std::size_t erase(vector<T>& v, const U& value);
+// template <class T, class Pred> std::size_t erase_if(vector<T>& v, Pred pred);
+// ---------------------------------------------------------------------------
 
 }
 

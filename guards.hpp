@@ -179,7 +179,7 @@ template <class T>
 template <class T>
 class construct_guard {
     T*        first_;
-    T* const* cur_;   // null once released
+    T* const* cur_;   // null once released // why not std::optional<T* const&> ? : not optional reference not valid before cpp-26
 
 public:
     // Guards [first, cur). `cur` must outlive the guard -- in practice both
