@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <compare>
 #include <cstddef>
+#include <initializer_list>
 #include <iterator>
+#include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -77,7 +80,10 @@ class vector {
     std::size_t size_ = 0;
     std::size_t cap_ = 0;
 
-   void relocate_and_commit(T* dest, std::size_t new_cap) {
+   // gap_len raw slots are left at dest + gap_at, for insert's new elements.
+   // Defaults: no gap, [0, size_) lands contiguously at dest.
+   void relocate_and_commit(T* dest, std::size_t new_cap,
+                            std::size_t gap_at = 0, std::size_t gap_len = 0) {
         // strong gaurantee
         // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
         // even copy throws (eactually more then move, then why move only on move_if_noexcept)
@@ -89,8 +95,16 @@ class vector {
         // the element it already put at the end.
         T* cur = dest;
         detail::construct_guard<T> cg(dest, cur);
-        for (std::size_t i = 0; i < size_; ++i, ++cur)
+        for (std::size_t i = 0; i < gap_at; ++i, ++cur)
             ::new (cur) T(std::move_if_noexcept(data_[i]));
+
+        // A second, disjoint range after the gap, so a second guard. If it
+        // throws, both guards unwind: this one first, then cg.
+        T* cur2 = dest + gap_at + gap_len;
+        detail::construct_guard<T> cg2(dest + gap_at + gap_len, cur2);
+        for (std::size_t i = gap_at; i < size_; ++i, ++cur2)
+            ::new (cur2) T(std::move_if_noexcept(data_[i]));
+        cg2.release();
         cg.release();
 
         // don't destroy in the same loop where you copy/move
@@ -154,6 +168,96 @@ class vector {
         g.release();
 
         size_ = n;
+    }
+
+    // Yields the same element forever: n copies of one value, as a source
+    // for insert_n_impl, which only uses * and prefix ++.
+    struct repeat_ref {
+        const T* p;
+        const T& operator*() const noexcept { return *p; }
+        repeat_ref& operator++() noexcept { return *this; }
+    };
+
+    // Opens a gap of n slots at idx and fills it with n values read from src
+    // (* and prefix ++). Shared by every insert/emplace. src must not alias
+    // *this -- callers copy aliased values out first.
+    //
+    // Strong: on reallocation (if relocation copies or can't throw), and
+    //         when idx == size_ (pure append into raw memory).
+    // Basic:  in place in the middle. Shifting the tail uses move
+    //         assignment, which can throw halfway. Same as std::vector.
+    template <class Src>
+    void insert_n_impl(std::size_t idx, std::size_t n, Src src) {
+        if (n == 0)
+            return;
+
+        if (n > cap_ - size_) {
+            if (n > std::numeric_limits<std::size_t>::max() - size_)
+                throw std::length_error("mystd: vector too long");
+            const std::size_t new_cap = std::max(size_ + n, cap_ * 2);
+            detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+            T* nb = ag.get();
+
+            // new elements first, into the gap; the old buffer is untouched
+            T* cur = nb + idx;
+            detail::construct_guard<T> ng(nb + idx, cur);
+            for (; cur != nb + idx + n; ++cur, ++src)
+                ::new (cur) T(*src);
+
+            relocate_and_commit(nb, new_cap, idx, n);
+            ng.release();
+            ag.release();
+            size_ += n;
+            return;
+        }
+
+        T* const pos     = data_ + idx;
+        T* const old_end = data_ + size_;
+        const std::size_t after = size_ - idx;
+
+        // Every step below extends the live prefix [0, size_) before the next
+        // one runs, so a throw never leaves raw slots inside it. That is the
+        // publishing rule again, one phase at a time.
+        if (after > n) {
+            // The gap is inside the live range. The last n tail elements move
+            // into raw memory (construct), the rest shift right (assign), and
+            // the gap is overwritten (assign).
+            T* cur = old_end;
+            detail::construct_guard<T> tg(old_end, cur);
+            for (T* s = old_end - n; s != old_end; ++s, ++cur)
+                ::new (cur) T(std::move(*s));
+            tg.release();
+            size_ += n;
+
+            std::move_backward(pos, old_end - n, old_end);
+            for (T* d = pos; d != pos + n; ++d, ++src)
+                *d = *src;
+        } else {
+            // The gap reaches past old_end. Values [after, n) go straight into
+            // raw memory, the whole tail moves past them, and values
+            // [0, after) are assigned over the moved-from tail. That order
+            // needs src twice, hence the copy.
+            Src mid = src;
+            for (std::size_t k = 0; k < after; ++k)
+                ++mid;
+
+            T* ncur = old_end;
+            detail::construct_guard<T> ng(old_end, ncur);
+            for (; ncur != pos + n; ++ncur, ++mid)
+                ::new (ncur) T(*mid);
+            ng.release();
+            size_ += n - after;
+
+            T* tcur = pos + n;
+            detail::construct_guard<T> tg(pos + n, tcur);
+            for (T* s = pos; s != old_end; ++s, ++tcur)
+                ::new (tcur) T(std::move(*s));
+            tg.release();
+            size_ += after;
+
+            for (T* d = pos; d != old_end; ++d, ++src)
+                *d = *src;
+        }
     }
 
 public:
@@ -719,6 +823,88 @@ public:
         --size_; // better, prevents dbl destructor call on dtor throw
         data_[size_].~T();
         // --size_; // still valid, since dtors aren't supposed to throw
+    }
+
+    // insert / emplace / erase take const_iterator positions and turn them
+    // into writable ones through the offset (pos - cbegin()), never by
+    // casting away const. Iterators at and after pos are invalidated; on
+    // reallocation, all of them.
+
+    // Strong at end() (it is emplace_back) and on reallocation; basic in the
+    // middle with spare capacity. Same as std::vector.
+    template <class... Args>
+    iterator emplace(const_iterator pos, Args&&... args) {
+        const std::size_t idx = static_cast<std::size_t>(pos - cbegin());
+        if (idx == size_) {
+            emplace_back(std::forward<Args>(args)...);
+            return iterator(data_ + idx);
+        }
+        // Built before anything moves: args may refer to an element that the
+        // shift is about to move or overwrite (v.emplace(v.begin(), v.back())).
+        T tmp(std::forward<Args>(args)...);
+        insert_n_impl(idx, 1, std::make_move_iterator(std::addressof(tmp)));
+        return iterator(data_ + idx);
+    }
+
+    // As emplace.
+    iterator insert(const_iterator pos, const T& value) {
+        return emplace(pos, value);
+    }
+
+    iterator insert(const_iterator pos, T&& value) {
+        return emplace(pos, std::move(value));
+    }
+
+    // Strong at end() and on reallocation; basic otherwise.
+    iterator insert(const_iterator pos, std::size_t n, const T& value) {
+        const std::size_t idx = static_cast<std::size_t>(pos - cbegin());
+        if (n == 0)
+            return iterator(data_ + idx);
+        const T tmp(value);   // value may be an element of *this
+        insert_n_impl(idx, n, repeat_ref{std::addressof(tmp)});
+        return iterator(data_ + idx);
+    }
+
+    // Strong at end() and on reallocation; basic otherwise.
+    // Precondition (as std): [first, last) is not a range into *this.
+    // Constrained so insert(pos, 3, 5) on vector<int> picks the (n, value)
+    // overload instead: unconstrained, this template is the better match.
+    template <std::input_iterator It>
+    iterator insert(const_iterator pos, It first, It last) {
+        const std::size_t idx = static_cast<std::size_t>(pos - cbegin());
+        if constexpr (std::forward_iterator<It>) {
+            const auto n = static_cast<std::size_t>(std::distance(first, last));
+            insert_n_impl(idx, n, first);
+        } else {
+            // Single pass: the count isn't known up front, and the range
+            // can't be read twice. Buffer it, then move the buffer in.
+            vector buf;
+            for (; first != last; ++first)
+                buf.emplace_back(*first);
+            insert_n_impl(idx, buf.size_, std::make_move_iterator(buf.data_));
+        }
+        return iterator(data_ + idx);
+    }
+
+    iterator insert(const_iterator pos, std::initializer_list<T> il) {
+        return insert(pos, il.begin(), il.end());
+    }
+
+    // Basic; nothrow if T's move assignment is noexcept. Same as std::vector.
+    iterator erase(const_iterator first, const_iterator last) {
+        T* const f = data_ + (first - cbegin());
+        T* const l = data_ + (last - cbegin());
+        if (f != l) {
+            T* const old_end = data_ + size_;
+            T* const new_end = std::move(l, old_end, f);
+            size_ = static_cast<std::size_t>(new_end - data_);   // publish, then destroy
+            detail::destroy_range(new_end, old_end);
+        }
+        return iterator(f);
+    }
+
+    iterator erase(const_iterator pos) {
+        return erase(pos, pos + 1);
     }
 
     /*
