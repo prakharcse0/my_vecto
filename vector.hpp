@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -82,7 +83,7 @@ class vector {
    // No gap: reserve, shrink_to_fit, resize, emplace_back (whose new element
    // sits at dest[size_], just past the prefix -- a gap at the end needs no
    // room left inside the relocated range).
-   void relocate_and_commit(T* dest, std::size_t new_cap) {
+   constexpr void relocate_and_commit(T* dest, std::size_t new_cap) {
         relocate_and_commit(dest, new_cap, size_, 0);
    }
 
@@ -92,7 +93,7 @@ class vector {
    // args may refer to old elements, which are only still alive before this),
    // guards it, and updates size_ afterwards. This function never touches
    // the gap and never changes size_.
-   void relocate_and_commit(T* dest, std::size_t new_cap,
+   constexpr void relocate_and_commit(T* dest, std::size_t new_cap,
                             std::size_t gap_at, std::size_t gap_len) {
         // strong gaurantee
         // dest[i] = std::move_if_noexcept(data_[i]); // wrong, dest[i] isn't initialised yet
@@ -106,7 +107,7 @@ class vector {
         T* cur = dest;
         detail::construct_guard<T> cg(dest, cur);
         for (std::size_t i = 0; i < gap_at; ++i, ++cur)
-            ::new (cur) T(std::move_if_noexcept(data_[i]));
+            std::construct_at(cur, std::move_if_noexcept(data_[i]));
 
         // The suffix is a SECOND live range, separated from the prefix by the
         // gap, so it needs its own guard. If a suffix construction throws,
@@ -115,7 +116,7 @@ class vector {
         T* scur = dest + gap_at + gap_len;
         detail::construct_guard<T> sg(scur, scur);
         for (std::size_t i = gap_at; i < size_; ++i, ++scur)
-            ::new (scur) T(std::move_if_noexcept(data_[i]));
+            std::construct_at(scur, std::move_if_noexcept(data_[i]));
         sg.release();
         cg.release();
 
@@ -127,7 +128,8 @@ class vector {
         // Everything below this point is noexcept -- this is the commit.
         detail::destroy_range(data_, data_ + size_);
 
-        ::operator delete(data_);
+        if(data_)
+            std::allocator<T>{}.deallocate(data_, cap_);
         data_ = dest;
         cap_ = new_cap; // must be done only after new_data is safely created/assigned, and data_ is safely updated;
         // else, if the program throws while doing the above, and caller catches it, you're in an broken invariant state
@@ -136,7 +138,7 @@ class vector {
 
     // Capacity for inserting n more: size_ + max(size_, n), as libstdc++.
     // Throws if size_ + n would wrap round (we'd allocate too little).
-    std::size_t grown_cap(std::size_t n) const {
+    constexpr std::size_t grown_cap(std::size_t n) const {
         if(n > std::numeric_limits<std::size_t>::max() - size_)
             throw std::length_error("mystd::vector::insert: too many elements");
         return size_ + std::max(size_, n);
@@ -149,7 +151,7 @@ class vector {
     // Same structure as insert(pos, n, value), with *first in place of
     // copy. No aliasing temporary: the range may not point into *this.
     template <class It>
-    void insert_counted(std::size_t index, It first, std::size_t n) {
+    constexpr void insert_counted(std::size_t index, It first, std::size_t n) {
         if(n == 0)
             return;
 
@@ -158,7 +160,7 @@ class vector {
             const std::size_t tail = old_size - index;
             if(n <= tail) {
                 while(size_ < old_size + n) {
-                    ::new (data_ + size_) T(std::move(data_[size_ - n]));
+                    std::construct_at(data_ + size_, std::move(data_[size_ - n]));
                     ++size_;
                 }
                 for(std::size_t i = old_size - n; i > index; --i)
@@ -171,11 +173,11 @@ class vector {
                 //         [mid, ...)   -> raw [old_size, index + n) (construct)
                 It mid = std::next(first, static_cast<std::iter_difference_t<It>>(tail));
                 for(; size_ < index + n; ++mid) {
-                    ::new (data_ + size_) T(*mid);
+                    std::construct_at(data_ + size_, *mid);
                     ++size_;
                 }
                 for(std::size_t i = index; i < old_size; ++i) {
-                    ::new (data_ + size_) T(std::move(data_[i]));
+                    std::construct_at(data_ + size_, std::move(data_[i]));
                     ++size_;
                 }
                 for(std::size_t i = index; i < old_size; ++i, ++first)
@@ -185,13 +187,13 @@ class vector {
         }
 
         const std::size_t new_cap = grown_cap(n);
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        detail::alloc_guard<T> ag(new_cap);
         T* nb = ag.get();
 
         T* hole = nb + index;
         detail::construct_guard<T> hg(nb + index, hole);
         for(; hole != nb + index + n; ++hole, ++first)
-            ::new (hole) T(*first);
+            std::construct_at(hole, *first);
 
         relocate_and_commit(nb, new_cap, index, n);
 
@@ -202,7 +204,7 @@ class vector {
     }
 
     template <class... Args>
-    void resize_impl(std::size_t n, const Args&... args) {
+    constexpr void resize_impl(std::size_t n, const Args&... args) {
         // strong gaurantee
         //
         // args is taken by const& (not forwarded): it is used once per new
@@ -220,14 +222,14 @@ class vector {
             // Geometric, matching emplace_back. Exact allocation would make
             // repeated resize(size()+1) quadratic.
             const std::size_t new_cap = std::max(n, cap_ * 2);
-            detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+            detail::alloc_guard<T> ag(new_cap);
             T* nb = ag.get();
 
             // 1. new elements FIRST -- args... may alias data_, still alive
             T* k = nb + size_;
             detail::construct_guard<T> kg(nb + size_, k);
             for (; k != nb + n; ++k)
-                ::new (k) T(args...);
+                std::construct_at(k, args...);
 
             // 2. only now may the old buffer be touched
             relocate_and_commit(nb, new_cap);
@@ -243,7 +245,7 @@ class vector {
         T* i = data_ + size_;
         detail::construct_guard<T> g(data_ + size_, i);
         for( ; i != data_ + n; ++i)
-            ::new (i) T(args...);
+            std::construct_at(i, args...);
         g.release();
 
         size_ = n;
@@ -255,7 +257,7 @@ public:
     class basic_iterator {
         using Elem = std::conditional_t<isConst, const T, T>;
         Elem *p_ = nullptr;
-        explicit basic_iterator(Elem *p) noexcept : p_(p) {}
+        constexpr explicit basic_iterator(Elem *p) noexcept : p_(p) {}
     public:
         // Signed and pointer-wide, i.e. what raw pointer subtraction gives.
         //   - not size_t: begin() - end() is negative, unsigned would wrap
@@ -310,7 +312,7 @@ public:
         //   - element_type: read by pointer_traits, not needed by
         //     std::to_address on GCC 13 -- operator-> is what it uses
 
-        basic_iterator(const basic_iterator<false>& it) noexcept requires isConst : p_(it.p_) {}
+        constexpr basic_iterator(const basic_iterator<false>& it) noexcept requires isConst : p_(it.p_) {}
         // if we just left it at the above:
         //                         default ctor     copy ctor       move ctor
         // basic_iterator<false>    suppressed      suppressed      suppressed
@@ -362,7 +364,7 @@ public:
 
         // Destructor is always generated unless you declare one.
 
-        Elem& operator*() const noexcept {
+        constexpr Elem& operator*() const noexcept {
             return *p_;
         }
 
@@ -372,7 +374,7 @@ public:
         // Also how std::to_address(it) turns an iterator into a raw pointer,
         // which contiguous_iterator requires. Unlike &*it it never
         // dereferences, so it is valid on end() too.
-        Elem* operator->() const noexcept {
+        constexpr Elem* operator->() const noexcept {
             return p_;
         }
 
@@ -391,7 +393,7 @@ public:
         //     converting ctor above; a free function may convert EITHER operand
         //   - hidden: found only by ADL, when an argument is a basic_iterator
         //   - != is free in C++20: a != b is rewritten as !(a == b)
-        friend bool operator==(const basic_iterator& a, const basic_iterator& b) noexcept { // = default
+        friend constexpr bool operator==(const basic_iterator& a, const basic_iterator& b) noexcept { // = default
             return a.p_ == b.p_;
         }
         // A function defined inside a class with friend is special: ordinary lookup can never see it, not even from inside the same namespace. Only ADL finds it, and only when one of the arguments has that class type (or the class is associated with an argument's type).
@@ -411,41 +413,41 @@ public:
         //     by hand to match ==, so both state exactly what is compared
         //   - weak/partial_ordering: two iterators to the same slot are
         //     interchangeable, and every pair in one vector is comparable
-        friend std::strong_ordering operator<=>(const basic_iterator& a, const basic_iterator& b) noexcept { // = default;
+        friend constexpr std::strong_ordering operator<=>(const basic_iterator& a, const basic_iterator& b) noexcept { // = default;
             return a.p_ <=> b.p_;
         }
         
-        basic_iterator& operator++() noexcept {
+        constexpr basic_iterator& operator++() noexcept {
             // if(p == data+size_)
             //     throw exception;
             ++p_;
             return *this;
         }
 
-        basic_iterator operator++(int) noexcept {
+        constexpr basic_iterator operator++(int) noexcept {
             basic_iterator old = *this;
             ++*this;
             return old;
         }
 
-        basic_iterator& operator--() noexcept {
+        constexpr basic_iterator& operator--() noexcept {
             --p_;
             return *this;
         }
 
-        basic_iterator operator--(int) noexcept {
+        constexpr basic_iterator operator--(int) noexcept {
             basic_iterator old = *this;
             --*this;
             return old;
         }
 
-        basic_iterator& operator+=(difference_type n) noexcept {
+        constexpr basic_iterator& operator+=(difference_type n) noexcept {
             p_ += n;
             return *this;
         }
 
         // Not `return *this += -n;`: -n overflows (UB) when n is PTRDIFF_MIN.
-        basic_iterator& operator-=(difference_type n) noexcept {
+        constexpr basic_iterator& operator-=(difference_type n) noexcept {
             p_ -= n;
             return *this;
         }
@@ -454,7 +456,7 @@ public:
         // ITERATOR (can't move it) is not constness of the ELEMENT -- like
         // T* const vs const T*. Only Elem decides whether you can write.
         // No bounds check, same as operator* and raw pointers.
-        Elem& operator[](difference_type n) const noexcept {
+        constexpr Elem& operator[](difference_type n) const noexcept {
             return p_[n];
         }
 
@@ -466,17 +468,17 @@ public:
         //   - `it` taken BY VALUE: the parameter is already the copy we
         //     return, so no separate local
         //   - there is no n - it: "5 minus an iterator" means nothing
-        friend basic_iterator operator+(basic_iterator it, difference_type n) noexcept {
+        friend constexpr basic_iterator operator+(basic_iterator it, difference_type n) noexcept {
             it += n;
             return it;
         }
 
-        friend basic_iterator operator+(difference_type n, basic_iterator it) noexcept {
+        friend constexpr basic_iterator operator+(difference_type n, basic_iterator it) noexcept {
             it += n;
             return it;
         }
 
-        friend basic_iterator operator-(basic_iterator it, difference_type n) noexcept {
+        friend constexpr basic_iterator operator-(basic_iterator it, difference_type n) noexcept {
             it -= n;
             return it;
         }
@@ -485,7 +487,7 @@ public:
         // not style. As a member, it - cit fails (`this` is never converted),
         // and unlike == / <=> C++20 has no reversed candidates for -.
         // As a friend, it - cit converts it -> const_iterator like ==.
-        friend difference_type operator-(const basic_iterator& a, const basic_iterator& b) noexcept {
+        friend constexpr difference_type operator-(const basic_iterator& a, const basic_iterator& b) noexcept {
             return a.p_ - b.p_;
         }
 
@@ -510,25 +512,25 @@ public:
 
     vector() noexcept = default;
 
-    void swap(vector& other) noexcept {
+    constexpr void swap(vector& other) noexcept {
         std::swap(data_, other.data_);
         std::swap(size_, other.size_);
         std::swap(cap_,  other.cap_);
     }
 
     // Inside the class template, vector<T> and vector mean the same thing (injected-class-name)
-    vector(const vector& other) : cap_(other.size_) {
+    constexpr vector(const vector& other) : cap_(other.size_) {
         if(!other.size_)
             return;
 
         // No need to publish each element via ++size_ any more: the guards own
         // the partial work until the commit. (The destructor still can't help
         // here -- a dtor isn't called if the ctor throws.)
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(other.size_));
+        detail::alloc_guard<T> ag(other.size_);
         T* cur = ag.get();
         detail::construct_guard<T> cg(ag.get(), cur);
         for(std::size_t i = 0; i < other.size_; ++i, ++cur)
-            ::new (cur) T(other.data_[i]);
+            std::construct_at(cur, other.data_[i]);
         cg.release();
 
         data_ = ag.get();
@@ -536,7 +538,7 @@ public:
         size_ = other.size_;
     }
 
-    vector& operator=(const vector& other) {
+    constexpr vector& operator=(const vector& other) {
         // nahh, always allocates:
         // vector tmp(other);
         // swap(tmp);
@@ -553,7 +555,7 @@ public:
 
             // we only enter this for loop if other.size_ > size_
             for( ; i < other.size_; ++i) {  
-                ::new (data_ + i) T(other[i]);
+                std::construct_at(data_ + i, other[i]);
                 ++size_; // why not just size_ = other.size_; at the end ? to keep it in a valid state
             }
 
@@ -566,17 +568,18 @@ public:
             return *this;
         }
 
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(other.size_));
+        detail::alloc_guard<T> ag(other.size_);
         T* cur = ag.get();
         detail::construct_guard<T> cg(ag.get(), cur);
         for (std::size_t i = 0; i < other.size_; ++i, ++cur)
-            ::new (cur) T(other.data_[i]);
+            std::construct_at(cur, other.data_[i]);
         cg.release();
         // size_, cap_, data_ unchanged if anything above threw -> strong
 
         // Commit. Nothing below can throw.
         detail::destroy_range(data_, data_ + size_);
-        ::operator delete(data_);
+        if(data_)
+            std::allocator<T>{}.deallocate(data_, cap_);
         // can't we just do ::delete data_ instead of above 2 lines ?
         // No: delete runs ~T() on ONE object then frees, and pairs with new,
         // not with ::operator new. We need destroy and free kept separate.
@@ -596,11 +599,11 @@ public:
         // noo, it breaks invariant if it throws at  this->data_ = static_cast....
     }
 
-    vector(vector && other) noexcept {
+    constexpr vector(vector && other) noexcept {
         swap(other);
     }
     
-    vector& operator=(vector&& other) noexcept {
+    constexpr vector& operator=(vector&& other) noexcept {
         // swap(other); // noo; whyy not ?
         // if u do a = move(b); , the original contents of a would get destroyed only when b goes outta scope;
         // this->~vector(); swap(other);
@@ -613,7 +616,8 @@ public:
         if (this == &other) return *this;        // self-move
 
         detail::destroy_range(data_, data_ + size_);
-        ::operator delete(data_);
+        if(data_)
+            std::allocator<T>{}.deallocate(data_, cap_);
 
         data_ = other.data_;
         size_ = other.size_;
@@ -626,42 +630,43 @@ public:
         return *this;
     }
 
-    ~vector() {
+    constexpr ~vector() {
         detail::destroy_range(data_, data_ + size_);
-        ::operator delete(data_);
+        if(data_)
+            std::allocator<T>{}.deallocate(data_, cap_);
     }
 
     // std::Increase the capacity of the vector (the total number of elements that the vector can hold without requiring reallocation) to a value that's greater or equal to new_cap
     // mine: to exactly provided, unless smaller then current
-    void reserve(std::size_t new_cap) {
+    constexpr void reserve(std::size_t new_cap) {
         if(new_cap <= cap_)
             return;
 
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        detail::alloc_guard<T> ag(new_cap);
         relocate_and_commit(ag.get(), new_cap);
         ag.release();   // relocate_and_commit succeeded: the block is data_ now
     }
 
-    void resize(std::size_t n) {
+    constexpr void resize(std::size_t n) {
         resize_impl(n);
     }
 
-    void resize(std::size_t n, const T& value) {
+    constexpr void resize(std::size_t n, const T& value) {
         resize_impl(n, value);
     }
 
-    void shrink_to_fit() {
+    constexpr void shrink_to_fit() {
         if(cap_ == size_)
             return;
 
         if (size_ == 0) {
-            ::operator delete(data_);
+        std::allocator<T>{}.deallocate(data_, cap_);
             data_ = nullptr;
             cap_ = 0;
             return;
         }
 
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(size_));
+        detail::alloc_guard<T> ag(size_);
         relocate_and_commit(ag.get(), size_);
         ag.release();
     }
@@ -670,9 +675,9 @@ public:
     // Args&& — a forwarding reference (aka "universal reference"), not an rvalue reference.
     // args... — pack expansion at the call site.
     template <class... Args>
-    T& emplace_back(Args&&... args) {
+    constexpr T& emplace_back(Args&&... args) {
         if(size_ != cap_) {
-            ::new (data_ + size_) T(std::forward<Args>(args)...); // std::forward is basically juist conditional move
+            std::construct_at(data_ + size_, std::forward<Args>(args)...); // std::forward is basically juist conditional move
             // std::forward(args...)                 // ONE call, all args passed to it
             // std::forward<Args>(args)...           // N calls, one per argument   ← correct
             // try (args) : expression contains unexpanded parameter pack args
@@ -681,7 +686,7 @@ public:
         }
         
         const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        detail::alloc_guard<T> ag(new_cap);
         T* nb = ag.get();
 
         // why must this always be done before the moving/copying to new buffer ?
@@ -689,7 +694,7 @@ public:
         // elements of the vector. The old buffer is still intact here.
         T* hole = nb + size_;
         detail::construct_guard<T> hg(nb + size_, hole);
-        ::new (hole) T(std::forward<Args>(args)...);
+        std::construct_at(hole, std::forward<Args>(args)...);
         ++hole;
 
         // Two disjoint live ranges now exist in nb: the prefix relocate_and_commit
@@ -704,7 +709,7 @@ public:
         return data_[size_ - 1];
     }
 
-    void push_back(const T& value) {
+    constexpr void push_back(const T& value) {
         // does it add extra cost of an extra function call
         // Zero cost from -O1 up: GCC inlines push_back into its caller and
         // emplace_back with it. Exception: copy-constructing an allocating type
@@ -714,7 +719,7 @@ public:
         emplace_back(value);
     }
 
-    void push_back(T&& value) {
+    constexpr void push_back(T&& value) {
         emplace_back(std::move(value));
     }
 
@@ -742,73 +747,73 @@ public:
 
     */
 
-    std::size_t size() const noexcept {
+    constexpr std::size_t size() const noexcept {
         return size_;
     }
 
-    std::size_t capacity() const noexcept {
+    constexpr std::size_t capacity() const noexcept {
         return cap_;
     }
 
-    bool empty() const noexcept {
+    constexpr bool empty() const noexcept {
         return !size_;
     }
 
-    T& operator[](std::size_t i) {
+    constexpr T& operator[](std::size_t i) {
         return data_[i];
     }
 
-    T* data() noexcept {
+    constexpr T* data() noexcept {
         return data_;
     }
 
-    T& at(std::size_t i) {
+    constexpr T& at(std::size_t i) {
         if(i >= size_)
             throw std::out_of_range("vector::at: index out of range");
         return data_[i];
     }
 
-    T& front() {
+    constexpr T& front() {
         // if(!size_)
         //     throw custom_exception;
         // calling front / back() on empty vector is undefined behaviour
         return data_[0];
     }
 
-    T& back() {
+    constexpr T& back() {
         // if(!size_)
         //     throw custom_exception;
         return data_[size_ - 1];
     }
 
-    const T& operator[](std::size_t i) const {
+    constexpr const T& operator[](std::size_t i) const {
         return data_[i];
     }
 
-    const T* data() const noexcept {
+    constexpr const T* data() const noexcept {
         return data_;
     }
 
-    const T& at(std::size_t i) const {
+    constexpr const T& at(std::size_t i) const {
         if(i >= size_)
             throw std::out_of_range("vector::at: index out of range");
         return data_[i];
     }
 
-    const T& front() const {
+    constexpr const T& front() const {
         return data_[0];
     }
 
-    const T& back() const {
+    constexpr const T& back() const {
         return data_[size_ - 1];
     }
 
-    void clear() noexcept {
+    constexpr void clear() noexcept {
         detail::destroy_range(data_, data_ + size_);
         size_ = 0;
     }
 
-    void pop_back() {
+    constexpr void pop_back() {
         --size_; // better, prevents dbl destructor call on dtor throw
         data_[size_].~T();
         // --size_; // still valid, since dtors aren't supposed to throw
@@ -839,19 +844,19 @@ public:
 
     */
 
-    iterator begin() noexcept {
+    constexpr iterator begin() noexcept {
         return iterator(data_);
     }
 
-    iterator end() noexcept {
+    constexpr iterator end() noexcept {
         return iterator(data_+size_);
     }
 
-    const_iterator begin() const noexcept {
+    constexpr const_iterator begin() const noexcept {
         return const_iterator(data_);
     }
 
-    const_iterator end() const noexcept {
+    constexpr const_iterator end() const noexcept {
         return const_iterator(data_+size_);
     }
 
@@ -860,8 +865,8 @@ public:
     //   - insert/erase (step 6) take const_iterator positions
     // Delegating: inside a const member *this is const, so begin() already
     // picks the const overload. One construction site, nothing to drift.
-    const_iterator cbegin() const noexcept { return begin(); }
-    const_iterator cend()   const noexcept { return end(); }
+    constexpr const_iterator cbegin() const noexcept { return begin(); }
+    constexpr const_iterator cend()   const noexcept { return end(); }
 
     // Reverse: rbegin wraps end(), rend wraps begin() -- NOT end()-1 and
     // begin()-1. reverse_iterator stores a base and dereferences the slot
@@ -875,12 +880,12 @@ public:
     //       erase(r.base())     -> WRONG element (or end(): UB). The element
     //                              *r is at std::prev(r.base()), so
     //                              v.erase(std::prev(r.base()))
-    reverse_iterator       rbegin()        noexcept { return reverse_iterator(end()); }
-    reverse_iterator       rend()          noexcept { return reverse_iterator(begin()); }
-    const_reverse_iterator rbegin()  const noexcept { return const_reverse_iterator(end()); }
-    const_reverse_iterator rend()    const noexcept { return const_reverse_iterator(begin()); }
-    const_reverse_iterator crbegin() const noexcept { return rbegin(); }
-    const_reverse_iterator crend()   const noexcept { return rend(); }
+    constexpr reverse_iterator       rbegin()        noexcept { return reverse_iterator(end()); }
+    constexpr reverse_iterator       rend()          noexcept { return reverse_iterator(begin()); }
+    constexpr const_reverse_iterator rbegin()  const noexcept { return const_reverse_iterator(end()); }
+    constexpr const_reverse_iterator rend()    const noexcept { return const_reverse_iterator(begin()); }
+    constexpr const_reverse_iterator crbegin() const noexcept { return rbegin(); }
+    constexpr const_reverse_iterator crend()   const noexcept { return rend(); }
 
     // =======================================================================
     // Step 6: insert / erase. Declarations only -- bodies are TODO.
@@ -949,7 +954,7 @@ public:
     //           Never allocates. Not noexcept in std (it can throw via T).
     //   aliasing: none possible -- no value argument.
     // -----------------------------------------------------------------------
-    iterator erase(const_iterator pos) {
+    constexpr iterator erase(const_iterator pos) {
         const std::size_t index = pos - cbegin();
 
         // Shift first: the only step that can throw, and assignment keeps
@@ -978,7 +983,7 @@ public:
     //   publishing rule: destroy the trailing slots and shrink size_ so
     //           [0, size_) never names a destroyed object.
     // -----------------------------------------------------------------------
-    iterator erase(const_iterator first, const_iterator last) {
+    constexpr iterator erase(const_iterator first, const_iterator last) {
         const std::size_t start_index = first - cbegin();
         const std::size_t end_index = last - cbegin();
         const std::size_t count = end_index - start_index;
@@ -1032,14 +1037,14 @@ public:
     //           std::move(v[i])) may plunder before a rollback.
     // -----------------------------------------------------------------------
     template <class... Args>
-    iterator emplace(const_iterator pos, Args&&... args) {
+    constexpr iterator emplace(const_iterator pos, Args&&... args) {
         // An index, not pos: path c frees the buffer pos points into.
         const std::size_t index = pos - cbegin();
 
         if (size_ != cap_) {
             // a) at the end: nothing to shift, construct straight into raw.
             if (index == size_) {
-                ::new (data_ + size_) T(std::forward<Args>(args)...);
+                std::construct_at(data_ + size_, std::forward<Args>(args)...);
                 ++size_;
                 return begin() + index;
             }
@@ -1055,7 +1060,7 @@ public:
             // The last element goes into the raw slot: CONSTRUCTION. Publish
             // it at once, so that if an assignment below throws, ~vector
             // still destroys it (every slot in [0, size_) stays live).
-            ::new (data_ + size_) T(std::move(data_[size_ - 1]));
+            std::construct_at<T>(data_ + size_, std::move(data_[size_ - 1]));
             ++size_;
 
             // The rest shift right by one, back to front, by ASSIGNMENT
@@ -1070,14 +1075,14 @@ public:
         // c) no room. size_ + max(size_, n) with n = 1: here size_ == cap_,
         // so it's the same doubling as emplace_back.
         const std::size_t new_cap = cap_ ? cap_ * 2 : 1;
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        detail::alloc_guard<T> ag(new_cap);
         T* nb = ag.get();
 
         // New element FIRST, into its gap -- the old buffer (which args may
         // point into) is still intact. Same reasoning as emplace_back.
         T* hole = nb + index;
         detail::construct_guard<T> hg(nb + index, hole);
-        ::new (hole) T(std::forward<Args>(args)...);
+        std::construct_at(hole, std::forward<Args>(args)...);
         ++hole;
 
         relocate_and_commit(nb, new_cap, index, 1);
@@ -1097,10 +1102,10 @@ public:
     //   emplace). The T&& one: std::move(value), not std::forward -- value
     //   is a named rvalue ref, i.e. an lvalue (same as push_back).
     // -----------------------------------------------------------------------
-    iterator insert(const_iterator pos, const T& value) {
+    constexpr iterator insert(const_iterator pos, const T& value) {
         return emplace(pos, value);
     }
-    iterator insert(const_iterator pos, T&& value) {
+    constexpr iterator insert(const_iterator pos, T&& value) {
         return emplace(pos, std::move(value));
     }
 
@@ -1123,7 +1128,7 @@ public:
     //           (v.insert(v.begin(), 3, v[1])). libstdc++ copies it into a
     //           temporary first (vector.tcc:540).
     // -----------------------------------------------------------------------
-    iterator insert(const_iterator pos, std::size_t n, const T& value) {
+    constexpr iterator insert(const_iterator pos, std::size_t n, const T& value) {
         const std::size_t index = pos - cbegin();
         if(n == 0)
             return begin() + index;
@@ -1142,7 +1147,7 @@ public:
             if(n <= tail) {
                 // last n of the tail -> raw [old_size, old_size + n)
                 while(size_ < old_size + n) {
-                    ::new (data_ + size_) T(std::move(data_[size_ - n]));
+                    std::construct_at(data_ + size_, std::move(data_[size_ - n]));
                     ++size_;
                 }
                 // rest of the tail right by n, back to front (live -> live)
@@ -1155,12 +1160,12 @@ public:
             else {
                 // n - tail copies -> raw [old_size, index + n)
                 while(size_ < index + n) {
-                    ::new (data_ + size_) T(copy);
+                    std::construct_at(data_ + size_, copy);
                     ++size_;
                 }
                 // whole tail -> raw [index + n, old_size + n)
                 for(std::size_t i = index; i < old_size; ++i) {
-                    ::new (data_ + size_) T(std::move(data_[i]));
+                    std::construct_at(data_ + size_, std::move(data_[i]));
                     ++size_;
                 }
                 // the other tail copies into the old tail slots (live)
@@ -1173,7 +1178,7 @@ public:
         // No room. grown_cap throws if a huge n would wrap size_ + n round
         // to a small number: we'd allocate too little and write past it.
         const std::size_t new_cap = grown_cap(n);
-        detail::alloc_guard<T> ag(detail::allocate_raw<T>(new_cap));
+        detail::alloc_guard<T> ag(new_cap);
         T* nb = ag.get();
 
         // n copies into the gap FIRST (value may live in the old buffer).
@@ -1182,7 +1187,7 @@ public:
         T* hole = nb + index;
         detail::construct_guard<T> hg(nb + index, hole);
         for(; hole != nb + index + n; ++hole)
-            ::new (hole) T(value);
+            std::construct_at(hole, value);
 
         relocate_and_commit(nb, new_cap, index, n);
 
@@ -1218,7 +1223,7 @@ public:
     //           ANY iterator operation (++, *, ==) -> BASIC.
     // -----------------------------------------------------------------------
     template <std::input_iterator InputIt>
-    iterator insert(const_iterator pos, InputIt first, InputIt last) {
+    constexpr iterator insert(const_iterator pos, InputIt first, InputIt last) {
         const std::size_t index = pos - cbegin();
 
         if constexpr (std::forward_iterator<InputIt>) {
@@ -1255,7 +1260,7 @@ public:
     // initializer_list CONSTRUCTOR -- that's still deferred).
     // initializer_list elements are const: you can only copy from them.
     // -----------------------------------------------------------------------
-    iterator insert(const_iterator pos, std::initializer_list<T> il) {
+    constexpr iterator insert(const_iterator pos, std::initializer_list<T> il) {
         return insert(pos, il.begin(), il.end());
     }
 };

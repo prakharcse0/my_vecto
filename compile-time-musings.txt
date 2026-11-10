@@ -1,0 +1,16 @@
+constexpr std::vector<int> primes_below(int n) { /* push_back loop */ }
+
+constexpr auto table = [] {               // compile time:
+    auto v = primes_below(30);            //   vector built on the compiler's simulated heap
+    std::array<int, 10> a{};              //   copy results into a fixed-size array
+    for (...) a[i] = v[i];
+    return a;                             //   vector destroyed here; only the array survives
+}();
+static_assert(table[9] == 29);            // ✅ compiles
+
+constexpr std::vector<int> g = primes_below(30);  // ❌ "refers to a result of 'operator new'"
+                                                  //    (heap memory can't escape into the program)
+
+int main(int argc, char**) {
+    auto v = primes_below(argc * 30);     // ✅ same function, plain runtime call, real heap
+}
